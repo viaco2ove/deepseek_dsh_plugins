@@ -1,20 +1,58 @@
 {
   "name": "dsh-Identify-local-files",
+  "description": "DeepSeek Harness dual-face plugin: a `+` button in the composer that uploads local files (drop, click, or clipboard image) into ~/.dsh/.temp/, then inserts them as read_local_file paths. Plus a host-side `read_local_file` tool for agents.",
   "version": "0.1.0",
-  "description": "DeepSeek Harness dual-face plugin: paste images and text files straight into the composer (clipboard-first workflow), plus a read_local_file tool for agents to read any local file by path (images as base64 data URLs).",
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MIT",
   "keywords": [
     "deepseek",
     "harness",
     "dsh",
-    "cordis",
-    "plugin",
+    "dsh-plugin",
     "clipboard",
     "paste",
     "file",
     "upload"
   ],
-  "type": "module",
-  "main": "lib/index.js",
+  "scripts": {
+    "build": "node build.mjs",
+    "prepare": "node build.mjs"
+  },
+  "dependencies": {
+    "schemastery": "^3.18.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-home-paths": "^0.1.0-rc.7 || ^0.1.1-rc.2 || ^0.1.2-alpha.2",
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.7 || ^0.1.1-rc.2 || ^0.1.2-alpha.2",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-client-runtime": "^0.1.1-rc.2",
+    "@deepseek-ai/dsh-home-paths": "^0.1.1-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.1.1-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ],
+      "external": [
+        "react",
+        "react/jsx-runtime",
+        "react-dom"
+      ]
+    }
+  },
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
@@ -24,29 +62,5 @@
     "lib",
     "cordis.patch.yml",
     "README.md"
-  ],
-  "license": "MIT",
-  "engines": {
-    "node": ">=22.6.0"
-  },
-  "dsh": {
-    "client": {
-      "inject": [
-        "@deepseek-ai/dsh-client-runtime"
-      ],
-      "platform": "web"
-    },
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    }
-  },
-  "peerDependencies": {
-    "@deepseek-ai/cordis": "*",
-    "@deepseek-ai/dsh-home-paths": "*",
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
-    "@deepseek-ai/schemastery": "^3.18.1"
-  },
-  "scripts": {
-    "build": "node build.mjs"
-  }
+  ]
 }
