@@ -1,0 +1,9 @@
+# dsh-Identify-local-files bundle patch: one insert registering the dual-face plugin.
+# The row name is the npm package name (used to import the plugin module).
+# The row id is an internal Cordis entry key (any unique value works).
+- insert:
+    - id: dsh-Identify-local-files
+      name: 'dsh-Identify-local-files'
+      config:
+        maxFileBytes: 20971520
+        maxTextBytes: 2097152
