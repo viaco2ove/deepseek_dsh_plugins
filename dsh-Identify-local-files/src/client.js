@@ -523,10 +523,9 @@ function apply(ctx) {
   }, DockEntry))
 }
 
-if (typeof module !== "undefined" && module !== null) {
-  module.exports = {
-    apply,
-    inject: ["slots", "sessions"],
-  };
-}
+module.exports = {
+  apply,
+  inject: ["slots", "sessions"],
+};
+return module.exports;
 }});
