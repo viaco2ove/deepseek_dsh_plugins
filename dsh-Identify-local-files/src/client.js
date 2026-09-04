@@ -145,6 +145,7 @@ const CSS_TEXT = `
 .dsh-ilf-button[data-active="true"] { background: var(--dsw-alias-interactive-bg-hover-solid, #d8e8ff); color: var(--dsw-alias-label-primary, #222); }
 .dsh-ilf-panel {
   width: 360px; max-width: 90vw;
+  max-height: 70vh; overflow-y: auto;
   background: var(--dsw-specific-input-major, #ffffff);
   border: 1px solid var(--dsw-alias-border-l2-darkmode-thin, #d0d0d0);
   border-radius: 12px;
@@ -470,14 +471,17 @@ function apply(ctx) {
     useEffect(() => {
       if (!open || buttonRef.current === null) return
       const rect = buttonRef.current.getBoundingClientRect()
-      setPanelPos({ top: rect.bottom + 8, left: Math.max(8, rect.right - 360) })
+      // Anchor the panel's BOTTOM edge 8px above the button's TOP edge so the
+      // panel grows UPWARD (the input bar sits near the viewport bottom, so a
+      // downward popup would be clipped off-screen).
+      setPanelPos({ bottom: window.innerHeight - rect.top + 8, left: Math.max(8, rect.right - 360) })
     }, [open])
 
     const panel = open && panelPos !== null
       ? react.createElement('div', {
           ref: panelRef,
           className: 'dsh-ilf-panel-anchor',
-          style: { position: 'fixed', top: panelPos.top, left: panelPos.left, zIndex: 9999 },
+          style: { position: 'fixed', bottom: panelPos.bottom, left: panelPos.left, zIndex: 9999 },
           children: react.createElement(Panel, { onClose: () => setOpen(false) }),
         })
       : null
