@@ -125,15 +125,10 @@ async function ingestFiles(ctx, files, announce) {
 
 // ─── React UI: button + panel ────────────────────────────────────────────────
 
-let react = null
-let jsxRuntime = null
-try { react = require('react') } catch (e) { /* React must be provided by the host runtime */ }
-try { jsxRuntime = require('react/jsx-runtime') } catch (e) { /* same */ }
-
-if (react === null || jsxRuntime === null) {
-  // Without React we cannot render the button; log loudly so a developer notices.
-  console.warn('[dsh-Identify-local-files] react not available; UI panel disabled (paste interceptor still active)')
-}
+// Mimic dsh-web-file-uploader: bare require at top level (NO try/catch).
+// react lives in the web shell's seed module table, so this resolves when the
+// plugin is loaded by the web runtime. If it ever misses, apply() guards.
+let react = require("react")
 
 const PLUGIN_TAG = 'dsh-Identify-local-files/Panel.module.css'
 const CSS_TEXT = `
@@ -219,7 +214,7 @@ function ensureCssInjected() {
 
 function PlusIcon() {
   // Inline SVG; keep it dependency-free so the build is portable.
-  return jsxRuntime.jsx('svg', {
+  return react.createElement('svg', {
     className: 'dsh-ilf-icon',
     viewBox: '0 0 16 16',
     fill: 'none',
@@ -227,8 +222,8 @@ function PlusIcon() {
     strokeWidth: 1.6,
     strokeLinecap: 'round',
     children: [
-      jsxRuntime.jsx('path', { d: 'M8 3v10' }),
-      jsxRuntime.jsx('path', { d: 'M3 8h10' }),
+      react.createElement('path', { d: 'M8 3v10', key: 'v' }),
+      react.createElement('path', { d: 'M3 8h10', key: 'h' }),
     ],
   })
 }
@@ -305,7 +300,7 @@ function makePanel(ctx) {
       handleFiles(e.dataTransfer?.files)
     }
 
-    return jsxRuntime.jsx('div', {
+    return react.createElement('div', {
       className: 'dsh-ilf-panel',
       role: 'dialog',
       'aria-label': 'Identify local files',
@@ -313,11 +308,11 @@ function makePanel(ctx) {
       onDragLeave,
       onDrop,
       children: [
-        jsxRuntime.jsxs('div', {
+        react.createElement('div', {
           className: 'dsh-ilf-panel-header',
           children: [
-            jsxRuntime.jsx('span', { children: 'Identify local files' }),
-            jsxRuntime.jsx('button', {
+            react.createElement('span', { children: 'Identify local files' }),
+            react.createElement('button', {
               type: 'button',
               'aria-label': 'close',
               onClick: onClose,
@@ -325,45 +320,46 @@ function makePanel(ctx) {
             }),
           ],
         }),
-        jsxRuntime.jsx('div', {
+        react.createElement('div', {
           className: 'dsh-ilf-drop',
           'data-drag': drag ? 'true' : 'false',
           onClick: onPickClick,
-          children: jsxRuntime.jsx('span', { children: 'Click here, or drop files to attach' }),
+          children: react.createElement('span', { children: 'Click here, or drop files to attach' }),
         }),
-        jsxRuntime.jsx('div', {
+        react.createElement('div', {
           className: 'dsh-ilf-row',
           children: [
-            jsxRuntime.jsx('button', {
+            react.createElement('button', {
               type: 'button',
               onClick: onPickClick,
               children: 'Choose files',
             }),
-            jsxRuntime.jsx('button', {
+            react.createElement('button', {
               type: 'button',
               onClick: onPasteClick,
               children: 'From clipboard image',
             }),
           ],
         }),
-        jsxRuntime.jsx('input', {
+        react.createElement('input', {
           ref: fileInputRef,
           type: 'file',
           multiple: true,
           style: { display: 'none' },
           onChange: onPickChange,
         }),
-        jsxRuntime.jsx('div', {
+        react.createElement('div', {
           className: 'dsh-ilf-hint',
           children: 'Files are saved to ~/.dsh/.temp/ and inserted as read_local_file paths. The Agent reads them on demand.',
         }),
-        items.length > 0 && jsxRuntime.jsx('div', {
+        items.length > 0 && react.createElement('div', {
           className: 'dsh-ilf-list',
-          children: items.map((item) => jsxRuntime.jsx('div', {
+          children: items.map((item) => react.createElement('div', {
             className: 'dsh-ilf-list-item',
             'data-stage': item.stage,
+            key: item.id,
             children: [
-              jsxRuntime.jsx('span', {
+              react.createElement('span', {
                 className: 'name',
                 children: item.stage === 'failed'
                   ? `${item.name} — ${item.error ?? 'failed'}`
@@ -372,7 +368,7 @@ function makePanel(ctx) {
                     : `${item.name} — ${item.path}`,
               }),
             ],
-          }, item.id)),
+          })),
         }),
       ],
     })
@@ -431,21 +427,25 @@ function installPasteInterceptor(ctx) {
 
 // ─── composer-dock entry ─────────────────────────────────────────────────────
 
+// Mimic dsh-web-file-uploader: apply() guards on react.createElement,
+// registers with (props) => react.createElement(Component, props),
+// and accesses ctx directly (ctx.slots / ctx.effect) without needing
+// sessionId passed through the inject function.
 function apply(ctx) {
-  console.log('[dsh-Identify-local-files] apply() called, react available:', react !== null, 'jsxRuntime available:', jsxRuntime !== null)
-  // Always keep the plain-text paste fallback on (works without React).
+  // Always keep the plain-text paste fallback active (works without React).
   installPasteInterceptor(ctx)
 
-  if (react === null || jsxRuntime === null) return
+  if (react === null || react.createElement === undefined) return
 
   const Panel = makePanel(ctx)
   const useState = react.useState
   const useEffect = react.useEffect
-  const createPortal = (() => {
-    try { return require('react-dom')?.createPortal } catch (e) { return null }
-  })()
+  let reactDom = null
+  try { reactDom = require('react-dom') } catch (_) {}
 
-  function DockEntry({ useSession, t }) {
+  // Plain function component — receives props from the slot system.
+  // dsh-web-file-uploader pattern: (props) => react.createElement(Component, props)
+  function IlfButton(props) {
     const [open, setOpen] = useState(false)
     const [panelPos, setPanelPos] = useState(null)
     const buttonRef = react.useRef(null)
@@ -474,54 +474,38 @@ function apply(ctx) {
     }, [open])
 
     const panel = open && panelPos !== null
-      ? jsxRuntime.jsx('div', {
+      ? react.createElement('div', {
           ref: panelRef,
           className: 'dsh-ilf-panel-anchor',
-          style: {
-            position: 'fixed',
-            top: panelPos.top,
-            left: panelPos.left,
-            zIndex: 9999,
-          },
-          children: jsxRuntime.jsx(Panel, { onClose: () => setOpen(false) }),
+          style: { position: 'fixed', top: panelPos.top, left: panelPos.left, zIndex: 9999 },
+          children: react.createElement(Panel, { onClose: () => setOpen(false) }),
         })
       : null
 
-    return jsxRuntime.jsxs(react.Fragment, {
-      children: [
-        jsxRuntime.jsx('button', {
-          ref: buttonRef,
-          type: 'button',
-          className: 'dsh-ilf-button',
-          'data-active': open ? 'true' : 'false',
-          'aria-label': 'Identify local files',
-          title: 'Identify local files',
-          onClick: () => setOpen((v) => !v),
-          onMouseDown: (e) => e.preventDefault(),
-          children: jsxRuntime.jsx(PlusIcon, {}),
-        }),
-        panel !== null && createPortal !== null
-          ? createPortal(panel, document.body)
-          : panel,
-      ],
-    })
+    return react.createElement(react.Fragment, null,
+      react.createElement('button', {
+        ref: buttonRef,
+        type: 'button',
+        className: 'dsh-ilf-button',
+        'data-active': open ? 'true' : 'false',
+        'aria-label': 'Identify local files',
+        title: 'Identify local files',
+        onClick: () => setOpen((v) => !v),
+        onMouseDown: (e) => e.preventDefault(),
+        children: react.createElement(PlusIcon),
+      }),
+      panel !== null && reactDom !== null
+        ? reactDom.createPortal(panel, document.body)
+        : panel,
+    )
   }
 
-  ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
-    name: 'conversation.composer.dock',
-    id: 'file-plus',
-    order: 10,
-    inject: (sessionId) => {
-      const sessions = ctx.get('sessions')
-      const actx = sessions?.scope?.(sessionId ?? '')
-      return {
-        activeSessionId: sessionId,
-        activeActx: actx,
-        addToComposer: (text) => actx !== undefined && insertIntoComposer(actx, text),
-        ctx,
-      }
-    },
-  }, DockEntry))
+  ctx.slots.inject('conversation.input.left', () =>
+    ctx.slots.register(
+      { name: 'conversation.input.left', id: 'dsh-ilf-btn', order: 0 },
+      (props) => react.createElement(IlfButton, props),
+    ),
+  )
 }
 
 module.exports = {
