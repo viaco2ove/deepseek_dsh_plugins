@@ -1,18 +1,71 @@
 // dsh-Identify-local-files — client half (browser).
-// Three surfaces:
-//   1. Composer dock: a `+` button that opens a panel.
-//   2. The panel accepts paste, file-drop, or clipboard images. Each accepted
-//      file is uploaded to the host's /plugins/.../temp-upload route, the host
-//      stores it under ~/.dsh/.temp/, and the client drops a
-//      `[file: <name> | /absolute/path]` line into the Composer. The Agent can
-//      then call `read_local_file` on that path to actually read the bytes.
-//   3. A plain-text paste interceptor is kept as a fallback for users who copy
-//      file bytes from a text editor instead of an OS file manager.
+// Core goal: intercept paste/drag events, upload files to the host, insert
+// file-reference chips into the composer, WITHOUT letting the official attachment
+// channel see the event (which would trigger "仅支持PNG、JPG、WebP、GIF").
+//
+// Three layers:
+//   1. Paste interceptor  — capture-phase listener, ALL file types consumed.
+//   2. Drag-drop overlay  — full-screen capture via dragenter/dragover/drop.
+//   3. Composer chip      — input.insertReference() for proper chip rendering,
+//                           plus inputTriggers source registration so chips
+//                           serialise through the trigger pipeline.
 
 window.__ModuleLoader__.load({ id: "dsh-Identify-local-files", factory: (require) => { var module = { exports: {} }; var exports = module.exports;
 "use strict";
 
+// ─── Module imports ────────────────────────────────────────────────────────────
+
+const react = require("react")
+
+// ─── Constants ─────────────────────────────────────────────────────────────────
+
+const SOURCE = 'identify-local-files'
+const PLUGIN_ID = 'dsh-Identify-local-files'
+
+// ─── CSS ─────────────────────────────────────────────────────────────────────
+
+const CSS_TEXT = `
+.dsh-ilf-overlay {
+  position: fixed; inset: 0; z-index: 99998;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0,0,0,.45); color: #fff;
+  font-size: 18px; font-weight: 600;
+  pointer-events: none; user-select: none;
+  backdrop-filter: blur(2px);
+  border-radius: 4px;
+}
+`
+
+let cssInjected = false
+function ensureCss() {
+  if (cssInjected || typeof document === 'undefined') return
+  cssInjected = true
+  const tag = document.createElement('style')
+  tag.dataset.plugin = PLUGIN_ID
+  tag.textContent = CSS_TEXT
+  document.head.appendChild(tag)
+}
+
+// ─── Upload helper ─────────────────────────────────────────────────────────────
+
+async function uploadFile(file) {
+  const form = new FormData()
+  form.append('file', file, file.name || 'pasted-file')
+  const res = await fetch('/plugins/dsh-Identify-local-files/temp-upload', {
+    method: 'POST',
+    body: form,
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`upload failed (${res.status}): ${text || res.statusText}`)
+  }
+  return await res.json() // { path, originalName, bytes, ... }
+}
+
+// ─── Text file inline content ─────────────────────────────────────────────────
+
 const INLINE_TEXT_LIMIT = 8192
+
 const TEXT_EXTENSIONS = new Set([
   '.txt', '.md', '.markdown', '.json', '.jsonc', '.json5', '.yaml', '.yml',
   '.toml', '.ini', '.cfg', '.conf', '.env', '.js', '.mjs', '.cjs', '.ts',
@@ -40,481 +93,211 @@ function formatBytes(n) {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`
 }
 
-function formatBaseName(name) {
-  const slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'))
-  return slash >= 0 ? name.slice(slash + 1) : name
+function baseName(path) {
+  const i = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+  return i >= 0 ? path.slice(i + 1) : path
 }
 
-// ─── composer insertion ──────────────────────────────────────────────────────
+// ─── insertReference — chip via official API ───────────────────────────────────
 
-function insertIntoComposer(actx, text) {
-  const conversation = actx.get('conversation')
-  if (conversation === undefined) {
-    console.warn('[dsh-Identify-local-files] conversation service unavailable')
-    return
+// Retry wrapper that polls until the composer is ready (phases: plain | claimed).
+async function withInput(fn) {
+  const MAX_WAIT = 4000
+  const POLL = 200
+  const deadline = Date.now() + MAX_WAIT
+  while (Date.now() < deadline) {
+    const actx = activeActx()
+    if (actx === null) { await sleep(POLL); continue }
+    const conversation = actx.get('conversation')
+    if (conversation === undefined) { await sleep(POLL); continue }
+    const input = conversation.input.for(actx)
+    if (input === undefined) { await sleep(POLL); continue }
+    const phase = (() => { try { return input.state.getSnapshot().phase } catch (_) { return null } })()
+    if (phase !== 'plain' && phase !== 'claimed') { await sleep(POLL); continue }
+    return fn(input)
   }
-  const input = conversation.input.for(actx)
-  const state = input.state.getSnapshot()
-  actx.emit('slash/input-insert-text', {
-    text,
-    span: { start: state.draft.length, end: state.draft.length, draftRev: state.draftRev },
-  })
+  return null
 }
 
-/** Pick the actx for the active conversation. The same scope the dock sees. */
-function activeActx(ctx) {
-  const sessions = ctx.get('sessions')
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
+
+function activeActx() {
+  const sessions = globalCtx && globalCtx.get('sessions')
   if (sessions === undefined) return null
   const list = typeof sessions.list === 'function' ? sessions.list() : []
   return sessions.scope(list[0]?.id ?? '')
 }
 
-// ─── file upload to host ────────────────────────────────────────────────────
+let globalCtx = null
 
-async function uploadFile(file) {
-  const form = new FormData()
-  form.append('file', file, file.name || 'pasted-file')
-  const res = await fetch('/plugins/dsh-Identify-local-files/temp-upload', {
-    method: 'POST',
-    body: form,
-  })
-  if (!res.ok) {
-    const text = await res.text().catch(() => '')
-    throw new Error(`upload failed (${res.status}): ${text || res.statusText}`)
-  }
-  return await res.json()
+function insertChipRef(input, file) {
+  const label = baseName(file.path)
+  const st = input.state.getSnapshot()
+  const pos = st.draft.length
+  const ok = input.insertReference(
+    { source: SOURCE, ref: file.path, label, clipboardText: file.path },
+    { start: pos, end: pos, draftRev: st.draftRev },
+  )
+  return ok
 }
 
-function buildFileAnnotation(uploaded, kind) {
-  // kind: "text" | "image" | "binary"
-  const name = formatBaseName(uploaded.originalName || uploaded.name || 'file')
-  const bytes = uploaded.bytes
-  const path = uploaded.path
-  if (kind === 'image') return `[image: ${name} (${formatBytes(bytes)}) — path: ${path}]`
-  if (kind === 'text') return `[file: ${name} (${formatBytes(bytes)}) — path: ${path}]`
-  return `[binary: ${name} (${formatBytes(bytes)}) — path: ${path}]`
+function insertPlainText(input, text) {
+  try {
+    const st = input.state.getSnapshot()
+    input.insertText(text, { start: st.draft.length, end: st.draft.length, draftRev: st.draftRev })
+    return true
+  } catch (_) { return false }
 }
 
-function kindOf(file) {
-  if (typeof file.type === 'string' && file.type.startsWith('image/')) return 'image'
-  if (isTextFile(file)) return 'text'
-  return 'binary'
+// ─── Drag state (shared, no React) ───────────────────────────────────────────
+
+const dragState = { active: false }
+
+// ─── Drag overlay (imperative DOM, no React) ─────────────────────────────────
+
+let overlayEl = null
+
+function showOverlay() {
+  if (overlayEl && overlayEl.isConnected) return
+  ensureCss()
+  overlayEl = document.createElement('div')
+  overlayEl.className = 'dsh-ilf-overlay'
+  overlayEl.textContent = '松开以接收文件'
+  document.body.appendChild(overlayEl)
+  dragState.active = true
 }
 
-async function ingestFiles(ctx, files, announce) {
-  const actx = activeActx(ctx)
-  if (actx === null) {
-    console.warn('[dsh-Identify-local-files] sessions service unavailable')
-    return
-  }
-  const lines = []
+function hideOverlay() {
+  if (overlayEl && overlayEl.isConnected) { overlayEl.remove(); overlayEl = null }
+  dragState.active = false
+}
+
+// ─── Process files from paste or drop ────────────────────────────────────────
+
+async function processFiles(files) {
   for (const file of files) {
     try {
-      announce?.({ stage: 'uploading', name: file.name })
       const uploaded = await uploadFile(file)
-      const kind = kindOf(file)
-      lines.push(buildFileAnnotation(uploaded, kind))
-      announce?.({ stage: 'done', name: file.name, path: uploaded.path })
+
+      if (isTextFile(file)) {
+        // Inline text: fetch content and insert as text chunk.
+        await withInput(input => {
+          let text
+          try { text = `[file: ${baseName(uploaded.path)} — path: ${uploaded.path}]\n` } catch (_) { text = `[file: ${uploaded.path}]\n` }
+          return insertPlainText(input, text)
+        })
+      } else {
+        // Binary / image / any: insert chip reference.
+        await withInput(input => insertChipRef(input, uploaded))
+      }
     } catch (err) {
-      announce?.({ stage: 'failed', name: file.name, error: String(err?.message ?? err) })
+      console.error('[dsh-Identify-local-files] upload error:', err && err.message ? err.message : err)
     }
   }
-  if (lines.length === 0) return
-  insertIntoComposer(actx, `\n${lines.join('\n')}\n`)
 }
 
-// ─── React UI: button + panel ────────────────────────────────────────────────
+// ─── Paste interceptor ────────────────────────────────────────────────────────
 
-// Mimic dsh-web-file-uploader: bare require at top level (NO try/catch).
-// react lives in the web shell's seed module table, so this resolves when the
-// plugin is loaded by the web runtime. If it ever misses, apply() guards.
-let react = require("react")
-
-const PLUGIN_TAG = 'dsh-Identify-local-files/Panel.module.css'
-const CSS_TEXT = `
-.dsh-ilf-button {
-  width: 32px; height: 32px; border-radius: 16px;
-  background: var(--dsw-specific-input-major, #f3f3f3);
-  color: var(--dsw-alias-label-secondary, #555);
-  border: 1px solid var(--dsw-alias-border-l2-darkmode-thin, #d0d0d0);
-  cursor: pointer;
-  display: inline-flex; align-items: center; justify-content: center;
-  transition: background .15s ease, color .15s ease, transform .1s ease;
-}
-.dsh-ilf-button:hover { background: var(--dsw-alias-interactive-bg-hover, #e8e8e8); color: var(--dsw-alias-label-primary, #222); }
-.dsh-ilf-button[data-active="true"] { background: var(--dsw-alias-interactive-bg-hover-solid, #d8e8ff); color: var(--dsw-alias-label-primary, #222); }
-.dsh-ilf-panel {
-  width: 360px; max-width: 90vw;
-  max-height: 70vh; overflow-y: auto;
-  background: var(--dsw-specific-input-major, #ffffff);
-  border: 1px solid var(--dsw-alias-border-l2-darkmode-thin, #d0d0d0);
-  border-radius: 12px;
-  box-shadow: var(--dsw-shadow-lv2, 0 8px 32px rgba(0,0,0,0.12));
-  padding: 12px;
-  display: flex; flex-direction: column; gap: 10px;
-  font-size: 13px; line-height: 1.4;
-  color: var(--dsw-alias-label-primary, #222);
-}
-.dsh-ilf-panel-header {
-  display: flex; align-items: center; justify-content: space-between;
-  font-weight: 500;
-}
-.dsh-ilf-panel-header button {
-  background: transparent; border: none; cursor: pointer; color: inherit; font-size: 18px; line-height: 1;
-}
-.dsh-ilf-drop {
-  border: 2px dashed var(--dsw-alias-border-l2, #c0c0c0);
-  border-radius: 8px;
-  padding: 18px; text-align: center;
-  color: var(--dsw-alias-label-tertiary, #777);
-  transition: background .15s ease, border-color .15s ease;
-}
-.dsh-ilf-drop[data-drag="true"] {
-  background: var(--dsw-alias-interactive-bg-hover, #eef5ff);
-  border-color: var(--dsw-alias-label-secondary, #88a);
-  color: var(--dsw-alias-label-primary, #222);
-}
-.dsh-ilf-row {
-  display: flex; gap: 8px; align-items: center;
-}
-.dsh-ilf-row button {
-  flex: 1; padding: 8px 10px;
-  background: var(--dsw-alias-interactive-bg-hover, #f1f1f1);
-  color: var(--dsw-alias-label-primary, #222);
-  border: 1px solid var(--dsw-alias-border-l2-darkmode-thin, #d0d0d0);
-  border-radius: 8px; cursor: pointer; font: inherit;
-}
-.dsh-ilf-row button:hover:not(:disabled) {
-  background: var(--dsw-alias-interactive-bg-hover-solid, #e3e3e3);
-}
-.dsh-ilf-row button:disabled { opacity: 0.5; cursor: not-allowed; }
-.dsh-ilf-list {
-  max-height: 160px; overflow: auto; padding: 4px;
-  border: 1px solid var(--dsw-alias-border-l2-darkmode-thin, #e0e0e0);
-  border-radius: 6px;
-  background: var(--dsw-alias-bg-module-platform, #fafafa);
-}
-.dsh-ilf-list-item { display: flex; align-items: center; gap: 8px; padding: 4px 6px; }
-.dsh-ilf-list-item .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dsh-ilf-list-item[data-stage="uploading"] .name { color: var(--dsw-alias-label-tertiary, #888); }
-.dsh-ilf-list-item[data-stage="done"] .name { color: var(--dsw-alias-label-primary, #222); }
-.dsh-ilf-list-item[data-stage="failed"] .name { color: var(--dsw-alias-state-error-primary, #c0392b); }
-.dsh-ilf-icon { width: 16px; height: 16px; flex: none; display: inline-block; }
-.dsh-ilf-hint { color: var(--dsw-alias-label-tertiary, #777); font-size: 12px; line-height: 1.5; }
-`
-
-function ensureCssInjected() {
-  if (typeof document === 'undefined') return
-  if (document.querySelector(`style[data-plugin-css="${PLUGIN_TAG}"]`) !== null) return
-  const tag = document.createElement('style')
-  tag.dataset.plugin = 'dsh-Identify-local-files'
-  tag.dataset.pluginCss = PLUGIN_TAG
-  tag.textContent = CSS_TEXT
-  document.head.appendChild(tag)
-}
-
-function PlusIcon() {
-  // Inline SVG; keep it dependency-free so the build is portable.
-  return react.createElement('svg', {
-    className: 'dsh-ilf-icon',
-    viewBox: '0 0 16 16',
-    fill: 'none',
-    stroke: 'currentColor',
-    strokeWidth: 1.6,
-    strokeLinecap: 'round',
-    children: [
-      react.createElement('path', { d: 'M8 3v10', key: 'v' }),
-      react.createElement('path', { d: 'M3 8h10', key: 'h' }),
-    ],
-  })
-}
-
-function makePanel(ctx) {
-  ensureCssInjected()
-  const useState = react.useState
-  const useEffect = react.useEffect
-  const useRef = react.useRef
-
-  function Panel({ onClose }) {
-    const [items, setItems] = useState([])
-    const [drag, setDrag] = useState(false)
-    const fileInputRef = useRef(null)
-
-    const announce = (entry) => {
-      setItems((prev) => {
-        const idx = prev.findIndex((p) => p.name === entry.name && p.stage !== 'done' && p.stage !== 'failed')
-        if (idx < 0) return [...prev, { id: Math.random().toString(36).slice(2), ...entry }]
-        const next = prev.slice()
-        next[idx] = { ...next[idx], ...entry }
-        return next
-      })
-    }
-
-    const handleFiles = async (fileList) => {
-      const files = Array.from(fileList ?? [])
-      if (files.length === 0) return
-      await ingestFiles(ctx, files, announce)
-    }
-
-    const onPickClick = () => fileInputRef.current?.click()
-
-    const onPickChange = (e) => {
-      handleFiles(e.target.files).then(() => { e.target.value = '' })
-    }
-
-    const onPasteClick = async () => {
-      if (typeof navigator === 'undefined' || !navigator.clipboard?.read) {
-        announce({ stage: 'failed', name: 'clipboard', error: 'clipboard read unavailable' })
-        return
-      }
-      try {
-        const items = await navigator.clipboard.read()
-        const files = []
-        for (const item of items) {
-          for (const type of item.types) {
-            if (type === 'text/plain' || type === 'text/html') continue
-            const blob = await item.getType(type).catch(() => null)
-            if (blob === null) continue
-            const ext = type.split('/')[1]?.split(';')[0] ?? 'bin'
-            files.push(new File([blob], `clipboard-${Date.now()}.${ext}`, { type }))
-            break
-          }
-        }
-        if (files.length === 0) {
-          announce({ stage: 'failed', name: 'clipboard', error: 'no image on clipboard' })
-          return
-        }
-        await handleFiles(files)
-      } catch (err) {
-        announce({ stage: 'failed', name: 'clipboard', error: String(err?.message ?? err) })
-      }
-    }
-
-    const onDragOver = (e) => {
-      e.preventDefault()
-      setDrag(true)
-    }
-    const onDragLeave = () => setDrag(false)
-    const onDrop = (e) => {
-      e.preventDefault()
-      setDrag(false)
-      handleFiles(e.dataTransfer?.files)
-    }
-
-    return react.createElement('div', {
-      className: 'dsh-ilf-panel',
-      role: 'dialog',
-      'aria-label': 'Identify local files',
-      onDragOver,
-      onDragLeave,
-      onDrop,
-      children: [
-        react.createElement('div', {
-          className: 'dsh-ilf-panel-header',
-          children: [
-            react.createElement('span', { children: 'Identify local files' }),
-            react.createElement('button', {
-              type: 'button',
-              'aria-label': 'close',
-              onClick: onClose,
-              children: '\u00d7',
-            }),
-          ],
-        }),
-        react.createElement('div', {
-          className: 'dsh-ilf-drop',
-          'data-drag': drag ? 'true' : 'false',
-          onClick: onPickClick,
-          children: react.createElement('span', { children: 'Click here, or drop files to attach' }),
-        }),
-        react.createElement('div', {
-          className: 'dsh-ilf-row',
-          children: [
-            react.createElement('button', {
-              type: 'button',
-              onClick: onPickClick,
-              children: 'Choose files',
-            }),
-            react.createElement('button', {
-              type: 'button',
-              onClick: onPasteClick,
-              children: 'From clipboard image',
-            }),
-          ],
-        }),
-        react.createElement('input', {
-          ref: fileInputRef,
-          type: 'file',
-          multiple: true,
-          style: { display: 'none' },
-          onChange: onPickChange,
-        }),
-        react.createElement('div', {
-          className: 'dsh-ilf-hint',
-          children: 'Files are saved to ~/.dsh/.temp/ and inserted as read_local_file paths. The Agent reads them on demand.',
-        }),
-        items.length > 0 && react.createElement('div', {
-          className: 'dsh-ilf-list',
-          children: items.map((item) => react.createElement('div', {
-            className: 'dsh-ilf-list-item',
-            'data-stage': item.stage,
-            key: item.id,
-            children: [
-              react.createElement('span', {
-                className: 'name',
-                children: item.stage === 'failed'
-                  ? `${item.name} — ${item.error ?? 'failed'}`
-                  : item.stage === 'uploading'
-                    ? `${item.name} — uploading…`
-                    : `${item.name} — ${item.path}`,
-              }),
-            ],
-          })),
-        }),
-      ],
-    })
-  }
-
-  return Panel
-}
-
-// ─── plain-text paste interceptor (fallback) ─────────────────────────────────
-
-function installPasteInterceptor(ctx) {
+function attachPasteListener() {
   const onPaste = (event) => {
-    const clipboardData = event.clipboardData ?? null
+    const clipboardData = event.clipboardData
     if (clipboardData === null) return
-    const files = Array.from(clipboardData.items)
-      .filter((item) => item.kind === 'file')
-      .map((item) => item.getAsFile())
-      .filter((file) => file !== null)
+
+    const items = Array.from(clipboardData.items)
+    const fileItems = items.filter(item => item.kind === 'file')
+    if (fileItems.length === 0) return
+
+    const files = fileItems.map(item => item.getAsFile()).filter(Boolean)
     if (files.length === 0) return
 
-    const others = files.filter((file) => !(typeof file.type === 'string' && file.type.startsWith('image/')))
-    if (others.length === 0) return // pure image paste: let the official channel run
-
+    // CRITICAL: preventDefault + stopImmediatePropagation in capture phase.
+    // This keeps the event from reaching the official attachment channel,
+    // which would throw "仅支持PNG、JPG、WebP、GIF" for non-image files.
     event.preventDefault()
     event.stopImmediatePropagation()
 
-    void (async () => {
-      const parts = []
-      for (const file of others) {
-        try {
-          if (isTextFile(file)) {
-            const text = await file.text()
-            if (text.length <= INLINE_TEXT_LIMIT) {
-              parts.push(`[file: ${file.name}]\n${text}`)
-            } else {
-              parts.push(`[file: ${file.name} — first ${INLINE_TEXT_LIMIT} chars of ${text.length}]\n${text.slice(0, INLINE_TEXT_LIMIT)}\n…[truncated]`)
-            }
-          } else {
-            parts.push(`[file: ${file.name} (${formatBytes(file.size)}) — non-text]`)
-          }
-        } catch (err) {
-          parts.push(`[file: ${file.name} — read failed: ${String(err?.message ?? err)}]`)
-        }
-      }
-      const joined = parts.join('\n\n')
-      if (joined === '') return
-      const actx = activeActx(ctx)
-      if (actx === null) return
-      insertIntoComposer(actx, `\n${joined}\n`)
-    })()
+    void processFiles(files)
   }
 
-  document.addEventListener('paste', onPaste, { capture: true })
-  ctx.effect(() => () => document.removeEventListener('paste', onPaste, { capture: true }))
+  document.addEventListener('paste', onPaste, true)
+  return () => document.removeEventListener('paste', onPaste, true)
 }
 
-// ─── composer-dock entry ─────────────────────────────────────────────────────
+// ─── Drag-drop interceptor ─────────────────────────────────────────────────────
 
-// Mimic dsh-web-file-uploader: apply() guards on react.createElement,
-// registers with (props) => react.createElement(Component, props),
-// and accesses ctx directly (ctx.slots / ctx.effect) without needing
-// sessionId passed through the inject function.
-function apply(ctx) {
-  // Always keep the plain-text paste fallback active (works without React).
-  installPasteInterceptor(ctx)
-
-  if (react === null || react.createElement === undefined) return
-
-  const Panel = makePanel(ctx)
-  const useState = react.useState
-  const useEffect = react.useEffect
-  let reactDom = null
-  try { reactDom = require('react-dom') } catch (_) {}
-
-  // Plain function component — receives props from the slot system.
-  // dsh-web-file-uploader pattern: (props) => react.createElement(Component, props)
-  function IlfButton(props) {
-    const [open, setOpen] = useState(false)
-    const [panelPos, setPanelPos] = useState(null)
-    const buttonRef = react.useRef(null)
-    const panelRef = react.useRef(null)
-
-    useEffect(() => {
-      if (!open) return
-      const onDocClick = (e) => {
-        if (panelRef.current?.contains(e.target)) return
-        if (buttonRef.current?.contains(e.target)) return
-        setOpen(false)
-      }
-      const onKey = (e) => { if (e.key === 'Escape') setOpen(false) }
-      document.addEventListener('mousedown', onDocClick)
-      document.addEventListener('keydown', onKey)
-      return () => {
-        document.removeEventListener('mousedown', onDocClick)
-        document.removeEventListener('keydown', onKey)
-      }
-    }, [open])
-
-    useEffect(() => {
-      if (!open || buttonRef.current === null) return
-      const rect = buttonRef.current.getBoundingClientRect()
-      // Anchor the panel's BOTTOM edge 8px above the button's TOP edge so the
-      // panel grows UPWARD (the input bar sits near the viewport bottom, so a
-      // downward popup would be clipped off-screen).
-      setPanelPos({ bottom: window.innerHeight - rect.top + 8, left: Math.max(8, rect.right - 360) })
-    }, [open])
-
-    const panel = open && panelPos !== null
-      ? react.createElement('div', {
-          ref: panelRef,
-          className: 'dsh-ilf-panel-anchor',
-          style: { position: 'fixed', bottom: panelPos.bottom, left: panelPos.left, zIndex: 9999 },
-          children: react.createElement(Panel, { onClose: () => setOpen(false) }),
-        })
-      : null
-
-    return react.createElement(react.Fragment, null,
-      react.createElement('button', {
-        ref: buttonRef,
-        type: 'button',
-        className: 'dsh-ilf-button',
-        'data-active': open ? 'true' : 'false',
-        'aria-label': 'Identify local files',
-        title: 'Identify local files',
-        onClick: () => setOpen((v) => !v),
-        onMouseDown: (e) => e.preventDefault(),
-        children: react.createElement(PlusIcon),
-      }),
-      panel !== null && reactDom !== null
-        ? reactDom.createPortal(panel, document.body)
-        : panel,
-    )
+function attachDragListeners() {
+  const hasFiles = e => {
+    const types = e.dataTransfer && e.dataTransfer.types
+    return !!(types && Array.from(types).some(t => t === 'Files'))
   }
 
-  ctx.slots.inject('conversation.input.left', () =>
-    ctx.slots.register(
-      { name: 'conversation.input.left', id: 'dsh-ilf-btn', order: 0 },
-      (props) => react.createElement(IlfButton, props),
-    ),
-  )
+  const onDragEnter = e => { if (hasFiles(e)) { e.preventDefault(); e.stopPropagation(); showOverlay() } }
+  const onDragOver   = e => { if (hasFiles(e)) { e.preventDefault(); e.stopImmediatePropagation() } }
+  const onDragLeave  = e => {
+    if (!hasFiles(e)) return
+    e.preventDefault(); e.stopPropagation()
+    // Only hide if leaving the overlay itself (not child elements).
+    if (overlayEl && !overlayEl.contains(e.relatedTarget)) hideOverlay()
+  }
+  const onDrop = e => {
+    e.preventDefault(); e.stopImmediatePropagation()
+    hideOverlay()
+    if (!hasFiles(e)) return
+    const files = Array.from((e.dataTransfer && e.dataTransfer.files) || [])
+    if (files.length === 0) return
+    void processFiles(files)
+  }
+
+  document.addEventListener('dragenter', onDragEnter, true)
+  document.addEventListener('dragover',  onDragOver,  true)
+  document.addEventListener('dragleave', onDragLeave, true)
+  document.addEventListener('drop',      onDrop,      true)
+
+  return () => {
+    document.removeEventListener('dragenter', onDragEnter, true)
+    document.removeEventListener('dragover',  onDragOver,  true)
+    document.removeEventListener('dragleave', onDragLeave, true)
+    document.removeEventListener('drop',      onDrop,      true)
+  }
+}
+
+// ─── Plugin apply ─────────────────────────────────────────────────────────────
+
+function apply(ctx) {
+  globalCtx = ctx
+
+  // 1) Register the chip source so chips survive submit serialisation.
+  const inputTriggers = ctx.get('inputTriggers')
+  if (inputTriggers !== undefined) {
+    ctx.effect(() => inputTriggers.registerSource({
+      trigger: '@',
+      name: SOURCE,
+      candidates: () => Promise.resolve([]),
+      onPick: () => undefined,
+      codec: {
+        clipboardText: (ref) => ref,
+        serialize: (ref) => Promise.resolve(ref),
+      },
+    }), `${PLUGIN_ID}: trigger source`)
+  }
+
+  // 2) Intercept paste events (capture phase, all file types).
+  const unlistenPaste = attachPasteListener()
+
+  // 3) Intercept drag-drop (full-screen overlay).
+  const unlistenDrag = attachDragListeners()
+
+  // 4) Cleanup on unload.
+  ctx.effect(() => () => {
+    unlistenPaste()
+    unlistenDrag()
+    hideOverlay()
+  })
 }
 
 module.exports = {
   apply,
-  inject: ["slots", "sessions"],
+  inject: ["slots", "sessions", "inputTriggers"],
 };
 return module.exports;
 }});
