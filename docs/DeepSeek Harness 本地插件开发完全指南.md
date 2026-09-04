@@ -283,6 +283,10 @@ https://github.com/GLFzr/dsh-file-upload
 先给 http://127.0.0.1:3081 web 环境 安装 D:\Users\viaco\PycharmProjects\deepseek_dsh_plugins\.cache\dsh-file-upload
 看看效果
 
+## 其他插件
+https://github.com/lhh010/dsh-paste-input.git
+https://github.com/Mooling0602/dsh-web-file-uploader.git
+dsh plugin --profile web add github:lywusichen/dsh-sidebar-buttons
 ## 插件市场（多！所以乱，插件也是如此多而乱）
 https://dsh.directory/
 https://dshmarket.com/zh/
