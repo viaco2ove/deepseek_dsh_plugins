@@ -45,11 +45,6 @@
       "platform": "web",
       "inject": [
         "@deepseek-ai/dsh-client-runtime"
-      ],
-      "external": [
-        "react",
-        "react/jsx-runtime",
-        "react-dom"
       ]
     }
   },

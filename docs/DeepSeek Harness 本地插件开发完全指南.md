@@ -277,3 +277,15 @@ https://deepseekharness.io/zh/plugin-development/
 
 ## dsh-market 插件例子（依然维护中的，比上面的可以过时的教程更有说服力）
 https://github.com/dsh-market/dsh-market
+
+## dsh-file-upload
+https://github.com/GLFzr/dsh-file-upload
+先给 http://127.0.0.1:3081 web 环境 安装 D:\Users\viaco\PycharmProjects\deepseek_dsh_plugins\.cache\dsh-file-upload
+看看效果
+
+## 插件市场（多！所以乱，插件也是如此多而乱）
+https://dsh.directory/
+https://dshmarket.com/zh/
+https://dsh.market/
+https://www.dsh-plugin.shop/
+

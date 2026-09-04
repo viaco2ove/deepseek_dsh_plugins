@@ -432,6 +432,7 @@ function installPasteInterceptor(ctx) {
 // ─── composer-dock entry ─────────────────────────────────────────────────────
 
 function apply(ctx) {
+  console.log('[dsh-Identify-local-files] apply() called, react available:', react !== null, 'jsxRuntime available:', jsxRuntime !== null)
   // Always keep the plain-text paste fallback on (works without React).
   installPasteInterceptor(ctx)
 
